@@ -25,13 +25,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut buffer = vec![0_u8; 1024];
 
-    let bytes_read = producer_stream.read(&mut buffer).await?;
+    loop {
+        let bytes_read = producer_stream.read(&mut buffer).await?;
 
-    println!("Broker received {bytes_read} bytes from producer.");
+        if bytes_read == 0 {
+            println!("Producer closed the connection.");
+            break;
+        }
 
-    consumer_stream.write_all(&buffer[..bytes_read]).await?;
+        println!("Broker received {bytes_read} bytes from producer.");
 
-    println!("Broker forwarded message to consumer.");
+        consumer_stream.write_all(&buffer[..bytes_read]).await?;
+
+        println!("Broker forwarded message to consumer.");
+    }
 
     Ok(())
 }

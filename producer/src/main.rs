@@ -9,11 +9,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Producer connected to broker.");
 
-    let message = "Hello from producer";
+    let messages = [
+        "Message One",
+        "Message Two",
+        "Message Three",
+        "Message Four",
+        "Message Five",
+    ];
 
-    stream.write_all(message.as_bytes()).await?;
+    for message in messages {
+        stream.write_all(message.as_bytes()).await?;
 
-    println!("Producer sent: {message}");
+        println!("Producer sent: {message}");
+    }
 
     Ok(())
 }
