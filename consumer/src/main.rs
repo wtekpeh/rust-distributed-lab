@@ -1,24 +1,31 @@
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Consumer starting...");
 
-    let mut stream = TcpStream::connect("127.0.0.1:7001").await?;
+    let stream = TcpStream::connect("127.0.0.1:7001").await?;
 
     println!("Consumer connected to broker.");
     println!("Waiting for message...");
 
-    let mut buffer = vec![0_u8; 1024];
+    let mut reader = BufReader::new(stream);
 
-    let bytes_read = stream.read(&mut buffer).await?;
+    loop {
+        let mut message = String::new();
 
-    println!("Consumer read {bytes_read} bytes.");
+        let bytes_read = reader.read_line(&mut message).await?;
 
-    let message = String::from_utf8_lossy(&buffer[..bytes_read]);
+        if bytes_read == 0 {
+            println!("Broker closed the connection.");
+            break;
+        }
 
-    println!("Consumer received: {message}");
+        let message = message.trim_end();
+
+        println!("Consumer received message: {message}");
+    }
 
     Ok(())
 }

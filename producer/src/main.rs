@@ -18,7 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for message in messages {
-        stream.write_all(message.as_bytes()).await?;
+        let framed_message = format!("{message}\n");
+        stream.write_all(framed_message.as_bytes()).await?;
 
         println!("Producer sent: {message}");
     }
