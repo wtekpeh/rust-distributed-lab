@@ -39,22 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ];
 
-    //Delimiter Framing
-    /*
-    for message in messages {
-        let framed_message = format!("{message}\n");
-        stream.write_all(framed_message.as_bytes()).await?;
-
-        println!("Producer sent: {message}");
-    }
-    */
-
-    //Fixed-Size Frames
     for message in messages {
         let serialized_message = serde_json::to_vec(&message)?;
 
         let message_length = serialized_message.len() as u32;
-
         let length_bytes = message_length.to_be_bytes();
 
         stream.write_all(&length_bytes).await?;

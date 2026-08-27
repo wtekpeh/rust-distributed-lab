@@ -1,5 +1,6 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,22 +24,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Producer connected from {producer_address}");
 
-    let mut buffer = vec![0_u8; 1024];
+    let (message_sender, mut message_receiver) = mpsc::channel::<Vec<u8>>(3);
 
-    loop {
-        let bytes_read = producer_stream.read(&mut buffer).await?;
+    let consumer_task = tokio::spawn(async move {
+        while let Some(message_buffer) = message_receiver.recv().await {
+            let message_length = message_buffer.len() as u32;
+            let length_bytes = message_length.to_be_bytes();
 
-        if bytes_read == 0 {
-            println!("Producer closed the connection.");
-            break;
+            consumer_stream.write_all(&length_bytes).await?;
+
+            consumer_stream.write_all(&message_buffer).await?;
+
+            println!("Broker sent one queued message of {message_length} bytes to consumer.");
         }
 
-        println!("Broker received {bytes_read} bytes from producer.");
+        Ok::<(), std::io::Error>(())
+    });
 
-        consumer_stream.write_all(&buffer[..bytes_read]).await?;
+    loop {
+        let mut length_buffer = [0_u8; 4];
 
-        println!("Broker forwarded message to consumer.");
+        match producer_stream.read_exact(&mut length_buffer).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                println!("Producer closed the connection.");
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let message_length = u32::from_be_bytes(length_buffer) as usize;
+
+        let mut message_buffer = vec![0_u8; message_length];
+
+        producer_stream.read_exact(&mut message_buffer).await?;
+
+        println!("Broker received one complete message of {message_length} bytes.");
+
+        println!("Broker attempting to queue message...");
+
+        message_sender.send(message_buffer).await?;
+
+        println!("Broker queued one message.");
     }
+
+    drop(message_sender);
+
+    consumer_task.await??;
 
     Ok(())
 }
