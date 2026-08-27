@@ -1,5 +1,12 @@
+use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+
+#[derive(Debug, Deserialize)]
+struct Message {
+    id: u64,
+    payload: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,9 +54,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         stream.read_exact(&mut message_buffer).await?;
 
-        let message = String::from_utf8_lossy(&message_buffer);
+        let message: Message = serde_json::from_slice(&message_buffer)?;
 
-        println!("Consumer received message of {message_length} bytes: {message}");
+        println!(
+            "Consumer received message {}: {}",
+            message.id, message.payload
+        );
     }
 
     Ok(())
