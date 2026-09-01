@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +60,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Consumer received message {}: {}",
             message.id, message.payload
         );
+
+        let ack_marker = 1_u8;
+
+        stream.write_all(&[ack_marker]).await?;
+
+        stream.write_all(&message.id.to_be_bytes()).await?;
+
+        println!("Consumer acknowledged message {}.", message.id);
     }
 
     Ok(())
