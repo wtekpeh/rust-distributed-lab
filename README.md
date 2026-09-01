@@ -144,9 +144,7 @@ Message Five
 ```
 
 The assumption was deliberately tested that one TCP write might
-correspond to one TCP read.
-
-It did not.
+correspond to one TCP read. It did not.
 
 The broker observed reads such as 22 bytes and 48 bytes despite the
 producer performing five separate writes. The consumer also received
@@ -154,12 +152,8 @@ multiple logical messages merged together.
 
 ### Key lesson
 
-TCP is a byte stream.
-
-TCP preserves byte ordering, but it does not preserve application
-message boundaries.
-
-This means:
+TCP is a byte stream. TCP preserves byte ordering, but it does not
+preserve application message boundaries.
 
 ``` text
 write()
@@ -179,15 +173,8 @@ A distributed application must define its own framing protocol.
 
 ### Temporary newline framing
 
-A newline delimiter was introduced temporarily:
-
-``` text
-Message One\n
-Message Two\n
-```
-
-The consumer used a buffered reader and `read_line()` to reconstruct
-messages.
+A newline delimiter was introduced temporarily. The consumer used a
+buffered reader and `read_line()` to reconstruct messages.
 
 This worked but introduced an ambiguity: what happens if the message
 payload itself contains a newline?
@@ -204,19 +191,9 @@ The protocol was changed to:
 
 using a 4-byte unsigned integer.
 
-The receiver first reads exactly four bytes:
-
-``` rust
-read_exact(&mut length_buffer)
-```
-
-then reconstructs the payload length:
-
-``` rust
-u32::from_be_bytes(length_buffer)
-```
-
-and finally reads exactly that many bytes.
+The receiver first reads exactly four bytes with `read_exact`,
+reconstructs the payload length with `u32::from_be_bytes`, and finally
+reads exactly that many payload bytes.
 
 ### Lessons learned
 
@@ -232,9 +209,7 @@ TCP itself does not answer that question.
 
 **Status: ✅ Complete**
 
-Messages were changed from plain strings to structured Rust data.
-
-Example:
+Messages were changed from plain strings to structured Rust data:
 
 ``` rust
 struct Message {
@@ -262,8 +237,6 @@ Rust Message
 
 ### Important distinction
 
-Framing and serialization solve different problems.
-
 Framing answers:
 
 > Where does this message end?
@@ -280,8 +253,6 @@ The producer and consumer each define their own Rust `Message`
 structure. They do not share the same in-memory object.
 
 Their compatibility comes from agreeing on the wire format.
-
-This is the beginning of an important distributed-systems concept:
 
 ``` text
 Schema = contract between independent services
@@ -333,21 +304,13 @@ The producer-facing side places complete message payloads into the
 queue. The consumer-side task independently removes them and sends them
 to the consumer.
 
-The broker is currently framing-aware but schema-unaware. It understands
-message boundaries but does not need to understand the JSON fields.
+The broker is framing-aware but schema-unaware: it understands message
+boundaries but does not need to understand the JSON fields.
 
-------------------------------------------------------------------------
-
-# Backpressure Experiment
+## Backpressure Experiment
 
 To make backpressure visible, the broker's consumer-side task was
-deliberately slowed.
-
-A two-second delay was temporarily added before draining queue entries.
-The queue capacity remained three messages.
-
-The producer attempted to send messages faster than the queue could
-drain.
+deliberately slowed by two seconds before draining queue entries.
 
 The broker reached:
 
@@ -355,21 +318,14 @@ The broker reached:
 Broker attempting to queue message...
 ```
 
-and paused before printing:
+and paused before:
 
 ``` text
 Broker queued one message.
 ```
 
-This showed that:
-
-``` rust
-message_sender.send(message).await
-```
-
-was suspended because the bounded queue had reached capacity.
-
-### First backpressure chain
+This showed that `message_sender.send(message).await` was suspended
+because the bounded queue had reached capacity.
 
 ``` text
 slow queue consumer
@@ -381,12 +337,7 @@ send().await waits
 producer-handling task stops progressing
 ```
 
-------------------------------------------------------------------------
-
-# End-to-End TCP Backpressure Experiment
-
-A second experiment tested whether backpressure could propagate all the
-way to the producer.
+## End-to-End TCP Backpressure Experiment
 
 The producer temporarily sent approximately 100 messages of about 1 MB
 each while the broker drained one queued message approximately every two
@@ -427,91 +378,192 @@ producer write_all().await blocks
 
 ### Important lesson
 
-Backpressure does not necessarily appear immediately at the producer.
+Backpressure does not necessarily appear immediately at the producer
+because multiple buffering layers exist between the application
+processes.
 
-There are multiple buffering layers:
-
-``` text
-Producer application
-       ↓
-Producer kernel TCP buffer
-       ↓
-TCP connection
-       ↓
-Broker kernel TCP buffer
-       ↓
-Broker application
-       ↓
-Bounded queue
-```
-
-Small workloads can be absorbed by these buffers and make an overloaded
-system temporarily appear healthy.
-
-------------------------------------------------------------------------
-
-## Why bounded queues matter
-
-An unbounded queue can allow upstream producers to continue adding work
-while downstream consumers cannot keep up.
-
-For example, with 1 MB messages:
-
-``` text
-10 messages       ≈ 10 MB
-100 messages      ≈ 100 MB
-1,000 messages    ≈ 1 GB
-10,000 messages   ≈ 10 GB
-```
-
-Eventually memory becomes the failure mechanism.
-
-A bounded queue instead forces overload to propagate upstream.
-
-The system effectively says:
+An unbounded queue can instead allow memory usage to grow without limit.
+A bounded queue forces overload to propagate upstream.
 
 > I have finite capacity. If downstream cannot keep up, upstream must
 > slow down.
 
 ------------------------------------------------------------------------
 
-# Current Architecture
+# V5 --- Multiple Producers
 
-After completing V4:
+**Status: ✅ Complete**
+
+The broker was changed from accepting only one producer connection to
+continuously accepting new producer connections.
+
+Previously, one accepted producer occupied the broker's
+producer-handling flow:
 
 ``` text
-                 TCP
-Producer ───────────────────► Broker
-                              │
-                              │ framing
-                              ▼
-                      ┌─────────────────┐
-                      │ Bounded MPSC    │
-                      │ Queue           │
-                      │ Capacity: 3     │
-                      └─────────────────┘
-                              │
-                              ▼
-                         Sender Task
-                              │
-                              │ TCP
-                              ▼
-                           Consumer
+accept producer
+      ↓
+handle producer
+      ↓
+producer disconnects
+```
+
+The V5 broker instead continuously accepts producers and gives each
+connection its own Tokio task:
+
+``` text
+accept Producer A
+      ↓
+spawn handler A
+
+accept Producer B
+      ↓
+spawn handler B
+
+accept Producer C
+      ↓
+spawn handler C
+```
+
+The producer-specific socket handling was moved into
+`handle_producer()`.
+
+The consumer-side queue draining was also separated into
+`handle_consumer()`, making the broker responsibilities clearer.
+
+## Shared bounded queue
+
+Each producer task receives a clone of the same `mpsc::Sender<Vec<u8>>`:
+
+``` rust
+let producer_message_sender = message_sender.clone();
+```
+
+Cloning the sender does **not** create another queue.
+
+``` text
+Producer A task ─┐
+                 │
+Producer B task ─┼──► ONE bounded MPSC queue ──► Consumer task
+                 │
+Producer C task ─┘
+```
+
+All producers therefore compete for the same finite queue capacity and
+retain the V4 backpressure behaviour.
+
+## Multi-producer experiment
+
+Two producer processes were started almost simultaneously.
+
+The broker accepted both TCP connections, with separate ephemeral ports:
+
+``` text
+Producer connected from 127.0.0.1:59778
+Producer connected from 127.0.0.1:59792
+```
+
+The logs then showed messages from the two producer handlers
+interleaving while both fed the shared queue.
+
+This demonstrated that the broker was no longer processing producer
+connections sequentially.
+
+## Lessons learned
+
+`TcpListener::accept()` accepts a connection, but does not itself create
+concurrent connection handling.
+
+Concurrency was introduced explicitly with `tokio::spawn()`.
+
+Each producer has:
+
+-   its own TCP connection;
+-   its own `TcpStream`;
+-   its own Tokio handler task;
+-   its own framing state.
+
+The producer tasks share access to one bounded broker queue through
+cloned sender handles.
+
+### Ordering with multiple producers
+
+TCP preserves ordering within an individual connection.
+
+If Producer A sends:
+
+``` text
+A1 → A2 → A3
+```
+
+the broker reads A1 before A2 before A3 from that connection.
+
+Likewise, Producer B can independently send:
+
+``` text
+B1 → B2 → B3
+```
+
+However, there is no automatic global ordering between independent
+producers.
+
+A broker may therefore observe:
+
+``` text
+A1
+B1
+B2
+A2
+A3
+B3
+```
+
+depending on arrival timing and task scheduling.
+
+This introduces an important distributed-systems distinction:
+
+> Per-connection ordering does not automatically provide global ordering
+> across independent producers.
+
+### Message identity observation
+
+Both test producer processes currently generate message IDs `1` through
+`5`.
+
+This means IDs that are unique within one producer are not necessarily
+globally unique once multiple independent producers exist.
+
+We will address stable message identity and idempotency in a later
+stage.
+
+------------------------------------------------------------------------
+
+# Current Architecture
+
+After completing V5:
+
+``` text
+Producer A ──► handler task A ──┐
+                                │
+Producer B ──► handler task B ──┼──► Bounded MPSC Queue ──► Consumer Task ──► Consumer
+                                │
+Producer C ──► handler task C ──┘
 ```
 
 Current characteristics:
 
--   one producer connection
+-   multiple producer connections
+-   one Tokio task per producer connection
 -   one consumer connection
--   persistent TCP connection during a run
 -   length-prefixed framing
 -   JSON serialization
 -   bounded in-memory queue
--   basic backpressure
+-   backpressure
+-   per-connection TCP ordering
+-   no global ordering guarantee across producers
 -   no persistence
 -   no acknowledgements
 -   no retry mechanism
--   no multiple producers
 -   no multiple consumers
 
 ------------------------------------------------------------------------
@@ -524,7 +576,7 @@ Current characteristics:
   V2        Multiple messages and framing           ✅
   V3        Structured messages and serialization   ✅
   V4        Bounded queue and backpressure          ✅
-  V5        Multiple producers                      ⏳
+  V5        Multiple producers                      ✅
   V6        Multiple consumers                      ⏳
   V7        Acknowledgements                        ⏳
   V8        Failure and retry                       ⏳
