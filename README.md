@@ -538,33 +538,258 @@ stage.
 
 ------------------------------------------------------------------------
 
+
+# V6 --- Multiple Consumers and Competing Consumption
+
+**Status: ✅ Complete**
+
+V5 allowed many producers to feed one bounded broker queue, but the
+consumer side still had an important limitation:
+
+``` text
+Producer A ──┐
+             │
+Producer B ──┼──► Bounded Queue ──► ONE Consumer
+             │
+Producer C ──┘
+```
+
+The broker accepted only one consumer connection, and the queue used a
+Tokio `mpsc::Receiver<Vec<u8>>`.
+
+## Why multiple consumers required a new design
+
+In V5, supporting multiple producers was straightforward because
+`mpsc::Sender` can be cloned:
+
+``` rust
+let producer_message_sender = message_sender.clone();
+```
+
+Every producer task could therefore own a sender while all cloned
+senders still fed the same underlying bounded queue.
+
+The receiving side is deliberately different. Tokio's `mpsc` is a
+**multiple-producer, single-consumer** channel. Its `Receiver` is not
+cloneable.
+
+Conceptually:
+
+``` text
+Sender A ──┐
+Sender B ──┼──► ONE queue ──► ONE Receiver
+Sender C ──┘
+```
+
+Simply creating several independent receivers would also be wrong for
+the behaviour we wanted, because the consumers need to compete for
+messages from the same queue rather than receive messages from separate
+queues.
+
+## Sharing the single receiver
+
+The receiver was therefore wrapped in:
+
+``` rust
+Arc<Mutex<mpsc::Receiver<Vec<u8>>>>
+```
+
+`Arc` allows multiple consumer tasks to hold references to the same
+underlying receiver. `Mutex` coordinates access so only one consumer
+task manipulates that receiver at a time.
+
+Each consumer task performs the queue receive inside a limited scope:
+
+``` rust
+let message_buffer = {
+    let mut receiver = message_receiver.lock().await;
+
+    receiver.recv().await
+};
+```
+
+Once a message has been removed from the queue, the mutex guard is
+dropped before the consumer task performs its TCP writes. The queue is
+therefore not kept locked while a consumer is sending data over the
+network.
+
+## Continuously accepting consumers
+
+The previous broker called `consumer_listener.accept()` only once.
+V6 moved consumer acceptance into its own asynchronous loop:
+
+``` text
+consumer accept loop
+      │
+      ├── accept Consumer A → spawn handler A
+      ├── accept Consumer B → spawn handler B
+      └── accept Consumer C → spawn handler C
+```
+
+The producer accept loop continues independently:
+
+``` text
+producer accept loop
+      │
+      ├── accept Producer A → spawn handler A
+      ├── accept Producer B → spawn handler B
+      └── accept Producer C → spawn handler C
+```
+
+The broker can therefore accept new producers and new consumers without
+one accept loop preventing the other from progressing.
+
+## Competing-consumer experiment
+
+The V6 test used one broker, two consumers, and one producer. The
+producer sent five messages.
+
+The first consumer received:
+
+``` text
+Message 1
+Message 3
+Message 5
+```
+
+The second consumer received:
+
+``` text
+Message 2
+Message 4
+```
+
+The broker logs confirmed two independent consumer TCP connections:
+
+``` text
+Consumer connected from 127.0.0.1:40656
+Consumer connected from 127.0.0.1:38918
+```
+
+The observed distribution was:
+
+``` text
+                 ┌──► Consumer 40656: M1, M3, M5
+Bounded Queue ───┤
+                 └──► Consumer 38918: M2, M4
+```
+
+No round-robin algorithm was explicitly implemented. The consumer tasks
+compete for access to the shared receiver. The alternating distribution
+observed in this run is therefore an observed scheduling outcome, not a
+guaranteed ordering rule.
+
+## Competing consumers are not broadcast
+
+V6 implements work-sharing semantics. A queued message is removed once
+and delivered to one competing consumer.
+
+This differs from broadcast/pub-sub, where each subscriber would receive
+its own copy. Pub/sub will be introduced separately in a later stage.
+
+## New reliability problem exposed by V6
+
+Multiple consumers improve work distribution, but they expose an
+important reliability problem.
+
+The current queue removes a message when a consumer task receives it:
+
+``` text
+queue contains M3
+      ↓
+consumer task receives M3
+      ↓
+M3 is removed from queue
+      ↓
+broker sends M3 over TCP
+      ↓
+consumer processes M3
+```
+
+Now consider a failure:
+
+``` text
+queue removes M3
+      ↓
+broker sends M3
+      ↓
+consumer crashes before safely processing it
+      ↓
+broker has no confirmation
+      ↓
+M3 is lost
+```
+
+The broker cannot currently distinguish successful processing from a
+consumer that received a message and then failed, because the consumer
+sends no confirmation back.
+
+This problem motivates the next stage:
+**V7 --- Acknowledgements**.
+
+### Lessons learned
+
+Multiple producers and multiple consumers are not symmetrical when using
+Tokio MPSC. Senders are cloneable, while the receiver has a single
+owner.
+
+`Arc` provides shared ownership of the receiver reference, while `Mutex`
+provides coordinated mutable access to that single receiver.
+
+A continuously running accept loop plus `tokio::spawn()` allows the
+broker to service multiple independent TCP connections concurrently.
+
+Competing consumers divide work from one queue; they do not broadcast
+every message to every consumer.
+
+Observed fair-looking distribution is not the same as a guaranteed
+round-robin policy.
+
+Most importantly, removing a message from an in-memory queue is not the
+same thing as proving that a remote consumer successfully processed it.
+That distinction leads directly to acknowledgements.
+
+------------------------------------------------------------------------
+
 # Current Architecture
 
-After completing V5:
+After completing V6:
 
 ``` text
 Producer A ──► handler task A ──┐
                                 │
-Producer B ──► handler task B ──┼──► Bounded MPSC Queue ──► Consumer Task ──► Consumer
-                                │
-Producer C ──► handler task C ──┘
+Producer B ──► handler task B ──┼──► Bounded MPSC Queue
+                                │           │
+Producer C ──► handler task C ──┘           │
+                                            ▼
+                                      Shared Receiver
+                                 Arc<Mutex<Receiver<_>>>
+                                      │           │
+                                      ▼           ▼
+                                  Consumer A   Consumer B
+                                  handler      handler
+                                   task         task
 ```
 
 Current characteristics:
 
 -   multiple producer connections
 -   one Tokio task per producer connection
--   one consumer connection
+-   multiple consumer connections
+-   one Tokio task per consumer connection
+-   competing-consumer work distribution
+-   one shared bounded in-memory queue
+-   coordinated access to the single Tokio MPSC receiver
 -   length-prefixed framing
 -   JSON serialization
--   bounded in-memory queue
 -   backpressure
 -   per-connection TCP ordering
--   no global ordering guarantee across producers
+-   no guaranteed global ordering across producers
+-   no guaranteed round-robin distribution across consumers
 -   no persistence
 -   no acknowledgements
 -   no retry mechanism
--   no multiple consumers
+
 
 ------------------------------------------------------------------------
 
@@ -577,7 +802,7 @@ Current characteristics:
   V3        Structured messages and serialization   ✅
   V4        Bounded queue and backpressure          ✅
   V5        Multiple producers                      ✅
-  V6        Multiple consumers                      ⏳
+  V6        Multiple consumers                      ✅
   V7        Acknowledgements                        ⏳
   V8        Failure and retry                       ⏳
   V9        Stable message IDs and idempotency      ⏳

@@ -1,6 +1,7 @@
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,17 +11,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let consumer_listener = TcpListener::bind("127.0.0.1:7001").await?;
 
     println!("Broker listening for producers on 127.0.0.1:7000");
-    println!("Broker listening for consumer on 127.0.0.1:7001");
-
-    println!("Waiting for consumer...");
-
-    let (consumer_stream, consumer_address) = consumer_listener.accept().await?;
-
-    println!("Consumer connected from {consumer_address}");
+    println!("Broker listening for consumers on 127.0.0.1:7001");
 
     let (message_sender, message_receiver) = mpsc::channel::<Vec<u8>>(3);
 
-    tokio::spawn(handle_consumer(consumer_stream, message_receiver));
+    let shared_message_receiver = Arc::new(Mutex::new(message_receiver));
+
+    let consumer_message_receiver = Arc::clone(&shared_message_receiver);
+
+    tokio::spawn(async move {
+        loop {
+            println!("Waiting for consumer...");
+
+            let result = consumer_listener.accept().await;
+
+            let (consumer_stream, consumer_address) = match result {
+                Ok(connection) => connection,
+
+                Err(error) => {
+                    eprintln!("Failed to accept consumer connection: {error}");
+
+                    continue;
+                }
+            };
+
+            println!("Consumer connected from {consumer_address}");
+
+            let consumer_receiver = Arc::clone(&consumer_message_receiver);
+
+            tokio::spawn(async move {
+                let result =
+                    handle_consumer(consumer_stream, consumer_address, consumer_receiver).await;
+
+                if let Err(error) = result {
+                    eprintln!("Consumer {consumer_address} handler failed: {error}");
+                }
+            });
+        }
+    });
 
     loop {
         println!("Waiting for producer...");
@@ -44,9 +72,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_consumer(
     mut consumer_stream: TcpStream,
-    mut message_receiver: mpsc::Receiver<Vec<u8>>,
+    consumer_address: std::net::SocketAddr,
+    message_receiver: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
 ) -> Result<(), std::io::Error> {
-    while let Some(message_buffer) = message_receiver.recv().await {
+    loop {
+        let message_buffer = {
+            let mut receiver = message_receiver.lock().await;
+
+            receiver.recv().await
+        };
+
+        let Some(message_buffer) = message_buffer else {
+            break;
+        };
+
         let message_length = message_buffer.len() as u32;
 
         let length_bytes = message_length.to_be_bytes();
@@ -57,7 +96,8 @@ async fn handle_consumer(
 
         println!(
             "Broker sent one queued message of \
-             {message_length} bytes to consumer."
+             {message_length} bytes to consumer \
+             {consumer_address}."
         );
     }
 
