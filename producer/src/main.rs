@@ -42,9 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for message in messages {
         let serialized_message = serde_json::to_vec(&message)?;
 
+        let message_id_bytes = message.id.to_be_bytes();
+
         let message_length = serialized_message.len() as u32;
         let length_bytes = message_length.to_be_bytes();
 
+        stream.write_all(&message_id_bytes).await?;
         stream.write_all(&length_bytes).await?;
         stream.write_all(&serialized_message).await?;
 
