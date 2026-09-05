@@ -25,6 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let consumer_message_receiver = Arc::clone(&shared_message_receiver);
 
+    let consumer_message_sender = message_sender.clone();
+
     tokio::spawn(async move {
         loop {
             println!("Waiting for consumer...");
@@ -45,9 +47,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let consumer_receiver = Arc::clone(&consumer_message_receiver);
 
+            let consumer_sender = consumer_message_sender.clone();
+
             tokio::spawn(async move {
-                let result =
-                    handle_consumer(consumer_stream, consumer_address, consumer_receiver).await;
+                let result = handle_consumer(
+                    consumer_stream,
+                    consumer_address,
+                    consumer_receiver,
+                    consumer_sender,
+                )
+                .await;
 
                 if let Err(error) = result {
                     eprintln!("Consumer {consumer_address} handler failed: {error}");
@@ -80,6 +89,7 @@ async fn handle_consumer(
     mut consumer_stream: TcpStream,
     consumer_address: std::net::SocketAddr,
     message_receiver: Arc<Mutex<mpsc::Receiver<BrokerMessage>>>,
+    message_sender: mpsc::Sender<BrokerMessage>,
 ) -> Result<(), std::io::Error> {
     loop {
         let broker_message = {
@@ -112,7 +122,30 @@ async fn handle_consumer(
 
         let mut ack_marker_buffer = [0_u8; 1];
 
-        consumer_stream.read_exact(&mut ack_marker_buffer).await?;
+        if let Err(error) = consumer_stream.read_exact(&mut ack_marker_buffer).await {
+            println!(
+                "Consumer {consumer_address} disconnected before \
+         acknowledging message {}.",
+                broker_message.id
+            );
+
+            println!("Requeueing message {}.", broker_message.id);
+
+            message_sender
+                .send(broker_message)
+                .await
+                .map_err(|send_error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!(
+                            "Failed to requeue message after consumer failure: \
+                     {send_error}"
+                        ),
+                    )
+                })?;
+
+            return Err(error);
+        }
 
         let ack_marker = ack_marker_buffer[0];
 

@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Consumer received broker message {} containing application message {}: {}",
             broker_message_id, message.id, message.payload
         );
+
         let ack_marker = 1_u8;
 
         stream.write_all(&[ack_marker]).await?;
