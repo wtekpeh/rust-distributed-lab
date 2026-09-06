@@ -55,17 +55,22 @@ processes them.
 
 # Current Wire Protocol
 
-Messages currently travel over TCP using a length-prefixed frame:
+Messages now travel over TCP using a broker envelope followed by the
+serialized application payload:
 
 ``` text
-┌──────────────────────┬─────────────────────────────┐
-│ 4-byte length prefix │ serialized message payload  │
-└──────────────────────┴─────────────────────────────┘
+┌───────────────────┬──────────────────────┬─────────────────────────────┐
+│ 8-byte message ID │ 4-byte payload length│ serialized message payload  │
+└───────────────────┴──────────────────────┴─────────────────────────────┘
 ```
 
-The length prefix is a big-endian `u32`. The payload is currently JSON.
+The broker message ID is a big-endian `u64`. The payload length is a
+big-endian `u32`. The payload is currently JSON.
 
-Example logical message:
+The broker therefore understands the message identity and framing
+metadata without needing to deserialize the application payload.
+
+Example application payload:
 
 ``` json
 {
@@ -74,9 +79,23 @@ Example logical message:
 }
 ```
 
-The producer serializes this structure using `serde_json`. The consumer
-reconstructs the TCP frame and then deserializes the JSON back into its
-own Rust `Message` structure.
+The application-level JSON still temporarily contains its own `id`.
+During V7 the broker envelope ID and application ID were deliberately
+kept separate so that broker-level delivery identity could be introduced
+without simultaneously redesigning the application schema. Stable,
+globally useful identity is deferred to V9.
+
+Consumer acknowledgements travel in the reverse direction on the same
+full-duplex TCP connection:
+
+``` text
+┌───────────────────┬──────────────────────┐
+│ 1-byte ACK marker │ 8-byte message ID    │
+└───────────────────┴──────────────────────┘
+```
+
+The valid ACK marker is currently `1`. The message ID allows the broker
+to correlate the acknowledgement with the message it has in flight.
 
 ------------------------------------------------------------------------
 
@@ -538,7 +557,6 @@ stage.
 
 ------------------------------------------------------------------------
 
-
 # V6 --- Multiple Consumers and Competing Consumption
 
 **Status: ✅ Complete**
@@ -615,8 +633,8 @@ network.
 
 ## Continuously accepting consumers
 
-The previous broker called `consumer_listener.accept()` only once.
-V6 moved consumer acceptance into its own asynchronous loop:
+The previous broker called `consumer_listener.accept()` only once. V6
+moved consumer acceptance into its own asynchronous loop:
 
 ``` text
 consumer accept loop
@@ -724,8 +742,7 @@ The broker cannot currently distinguish successful processing from a
 consumer that received a message and then failed, because the consumer
 sends no confirmation back.
 
-This problem motivates the next stage:
-**V7 --- Acknowledgements**.
+This problem motivates the next stage: **V7 --- Acknowledgements**.
 
 ### Lessons learned
 
@@ -751,15 +768,336 @@ That distinction leads directly to acknowledgements.
 
 ------------------------------------------------------------------------
 
+# V7 --- Application-Level Acknowledgements
+
+**Status: ✅ Complete**
+
+V6 exposed a reliability gap: removing a message from the queue only
+proved that a broker task had obtained it. It did not prove that the
+remote consumer had successfully received and processed it.
+
+V7 introduced an application-level acknowledgement from consumer to
+broker.
+
+The delivery sequence became:
+
+``` text
+Broker                                  Consumer
+  │                                        │
+  │ message ID + length + payload          │
+  ├───────────────────────────────────────►│
+  │                                        │
+  │                         reconstruct frame
+  │                         deserialize payload
+  │                         process message
+  │                                        │
+  │          ACK marker + message ID       │
+  │◄───────────────────────────────────────┤
+  │                                        │
+```
+
+This ACK is different from TCP's own transport-level acknowledgement.
+TCP can confirm that bytes were transported through the connection, but
+the broker needs application-level evidence that the consumer reached
+the point in its processing at which the message can be considered
+complete.
+
+## Broker message envelope
+
+Before V7, the queue stored only opaque JSON bytes. That created a
+problem for acknowledgement correlation: the broker would have needed to
+deserialize business JSON merely to discover the message ID.
+
+The wire protocol was therefore changed from:
+
+``` text
+[length][payload]
+```
+
+to:
+
+``` text
+[broker message ID][payload length][payload]
+```
+
+and the broker queue now stores:
+
+``` rust
+struct BrokerMessage {
+    id: u64,
+    payload: Vec<u8>,
+}
+```
+
+This keeps broker metadata outside the application payload. The broker
+remains schema-unaware while still knowing the identity of the delivery
+it is managing.
+
+## One in-flight message per consumer
+
+The current consumer handler sends one message and then waits for that
+message's ACK before taking another message for the same consumer.
+
+``` text
+dequeue M1
+   ↓
+send M1
+   ↓
+wait for ACK M1
+   ↓
+ACK received
+   ↓
+dequeue next message
+```
+
+This intentionally keeps acknowledgement correlation simple at this
+stage.
+
+## Failure experiment
+
+The consumer was deliberately terminated after receiving message 3 but
+before sending its ACK.
+
+The broker had already removed message 3 from the queue and was waiting
+for acknowledgement. The TCP connection closed and the broker observed
+`early eof`.
+
+Messages 4 and 5 remained queued, but message 3 was lost because V7 had
+not yet implemented a retry path.
+
+This experiment established the distinction between:
+
+``` text
+QUEUED
+IN_FLIGHT
+ACKED
+```
+
+and directly motivated V8.
+
+### Lessons learned
+
+A successful socket write is not proof of successful remote application
+processing.
+
+Acknowledgements must be part of the application protocol when the
+broker needs evidence of consumer completion.
+
+The point at which a real consumer sends an ACK matters. If it
+acknowledges before performing durable or business-critical work, a
+later consumer failure can still lose the work.
+
+Broker-level metadata should not require the broker to understand the
+business payload.
+
+------------------------------------------------------------------------
+
+# V8 --- Failure Detection, Retry and Requeue
+
+**Status: ✅ Complete**
+
+V7 allowed the broker to know when a consumer acknowledged a message,
+but a failed in-flight delivery could still lose the message.
+
+V8 introduced a requeue path.
+
+The broker's message state can now be viewed as:
+
+``` text
+QUEUED
+  ↓
+IN_FLIGHT
+  ↓        ↘
+ACKED      FAILED
+             ↓
+           QUEUED
+```
+
+If delivery succeeds and the expected ACK arrives, the message is
+complete. If delivery fails before a valid ACK is accepted, the
+`BrokerMessage` is returned to the bounded queue.
+
+## Centralized delivery boundary
+
+The complete send-and-acknowledge exchange was extracted into:
+
+``` rust
+deliver_and_wait_for_ack(...)
+```
+
+This function owns the delivery protocol for one in-flight message:
+
+``` text
+write broker message ID
+write payload length
+write payload
+wait for ACK marker
+validate ACK marker
+wait for ACK message ID
+validate ACK message ID
+```
+
+It returns `Ok(())` only when the expected acknowledgement has been
+received.
+
+Any delivery error becomes one `Err` path in `handle_consumer()`:
+
+``` text
+deliver_and_wait_for_ack()
+          ↓
+       Result
+       /    \
+     Ok      Err
+              ↓
+           requeue
+```
+
+This avoids scattering retry decisions across individual socket
+operations.
+
+## Retry experiment: consumer disconnect
+
+The consumer was deliberately stopped after receiving message 3 but
+before acknowledging it.
+
+The broker observed:
+
+``` text
+Delivery of message 3 ... failed: early eof
+Requeueing message 3.
+```
+
+A later consumer could receive the requeued message.
+
+Because requeueing currently places the failed message at the tail,
+messages that were already queued can be delivered before the retry. The
+experiment therefore demonstrated that retry can change observed
+delivery order.
+
+It also demonstrated a future poison-message problem: when the same
+deterministic failure was left in the consumer, every consumer that
+received message 3 failed again. Retry limits and dead-letter handling
+are intentionally deferred to later stages.
+
+## ACK timeout
+
+A consumer does not have to disconnect in order to fail.
+
+It can remain connected while becoming stuck and never send an ACK.
+Without a deadline, the broker would wait forever and the message would
+remain in flight indefinitely.
+
+V8 therefore introduced an application-level ACK timeout using Tokio's
+`timeout()` and a three-second experimental deadline.
+
+The nested result represents two different failure layers:
+
+``` text
+Ok(Ok(...))       ACK read completed successfully
+Ok(Err(io_error)) TCP read completed with an I/O failure
+Err(elapsed)      operation did not complete before the deadline
+```
+
+Timeouts were applied to both the ACK marker read and the ACK message ID
+read.
+
+The experiment deliberately kept the consumer connection alive for ten
+seconds without acknowledging message 3. The broker independently
+detected the missing acknowledgement after three seconds:
+
+``` text
+Delivery of message 3 ... failed:
+Timed out waiting for ACK marker ...
+Requeueing message 3.
+```
+
+The broker then closed that consumer handler's connection. This proved
+that failure detection no longer depends solely on the remote process
+terminating.
+
+## Invalid-ACK experiment
+
+The consumer was temporarily changed to send ACK marker `2` for message
+3 instead of the valid marker `1`.
+
+The consumer locally reported that it had written its acknowledgement,
+but the broker rejected the protocol message:
+
+``` text
+Consumer ... sent invalid ACK marker 2
+Requeueing message 3.
+```
+
+This demonstrated an important distributed distinction:
+
+``` text
+consumer wrote ACK bytes
+        ≠
+broker accepted the ACK
+```
+
+A live TCP connection is not sufficient. The peer must also obey the
+application protocol.
+
+## Final regression run
+
+After removing all artificial failures, messages 1 through 5 were sent,
+received and acknowledged successfully in order.
+
+This confirmed that the V8 reliability machinery does not disturb the
+normal successful delivery path.
+
+## Delivery semantics after V8
+
+V8 moves the in-memory broker toward **at-least-once delivery within the
+lifetime of the broker process**.
+
+That qualification is important. The queue is still in memory, so a
+broker process crash can lose queued and in-flight state. Durable
+recovery is deferred to V10 persistence.
+
+Retries also introduce the possibility of duplicate processing. A
+consumer might successfully perform its work and then lose the
+connection before the broker receives the ACK. The broker cannot know
+whether the work happened; it can only know that proof of completion did
+not arrive before the delivery failed or timed out.
+
+The safe response is to retry, which means the consumer may see the same
+logical message again.
+
+That uncertainty motivates V9: stable message identity and idempotent
+consumer processing.
+
+### Lessons learned
+
+Failure detection needs more than noticing closed TCP connections.
+
+Remote operations need bounded waiting; a healthy-looking connection can
+still contain a stuck peer.
+
+A timeout is an application policy about how long the broker is willing
+to wait for proof of completion.
+
+Centralizing the send/ACK exchange gives all delivery failures one
+consistent retry path.
+
+Retries improve reliability but can reorder messages and create
+duplicates.
+
+At-least-once delivery and idempotent processing are therefore closely
+related.
+
+------------------------------------------------------------------------
+
 # Current Architecture
 
-After completing V6:
+After completing V8:
 
 ``` text
 Producer A ──► handler task A ──┐
                                 │
 Producer B ──► handler task B ──┼──► Bounded MPSC Queue
-                                │           │
+                                │       BrokerMessage
 Producer C ──► handler task C ──┘           │
                                             ▼
                                       Shared Receiver
@@ -768,7 +1106,16 @@ Producer C ──► handler task C ──┘           │
                                       ▼           ▼
                                   Consumer A   Consumer B
                                   handler      handler
-                                   task         task
+                                      │           │
+                                      ▼           ▼
+                                send one message + wait
+                                for application ACK
+                                      │
+                           ┌──────────┴──────────┐
+                           ▼                     ▼
+                         ACK                   failure
+                           │                     │
+                        complete              requeue
 ```
 
 Current characteristics:
@@ -779,17 +1126,24 @@ Current characteristics:
 -   one Tokio task per consumer connection
 -   competing-consumer work distribution
 -   one shared bounded in-memory queue
--   coordinated access to the single Tokio MPSC receiver
--   length-prefixed framing
--   JSON serialization
+-   `BrokerMessage { id, payload }` broker envelope
+-   broker-level message identity on the wire
+-   JSON application payload remains opaque to the broker
+-   application-level consumer acknowledgements
+-   one in-flight message per consumer connection
+-   ACK marker and ACK message-ID validation
+-   ACK deadlines
+-   requeue after delivery failure
+-   retry-induced reordering is possible
+-   duplicate delivery is possible
 -   backpressure
 -   per-connection TCP ordering
 -   no guaranteed global ordering across producers
 -   no guaranteed round-robin distribution across consumers
--   no persistence
--   no acknowledgements
--   no retry mechanism
-
+-   no durable persistence
+-   no globally stable message identity yet
+-   no consumer idempotency yet
+-   no retry limit or dead-letter queue yet
 
 ------------------------------------------------------------------------
 
@@ -803,8 +1157,8 @@ Current characteristics:
   V4        Bounded queue and backpressure          ✅
   V5        Multiple producers                      ✅
   V6        Multiple consumers                      ✅
-  V7        Acknowledgements                        ⏳
-  V8        Failure and retry                       ⏳
+  V7        Acknowledgements                        ✅
+  V8        Failure and retry                       ✅
   V9        Stable message IDs and idempotency      ⏳
   V10       Persistence                             ⏳
   V11       Pub/Sub                                 ⏳

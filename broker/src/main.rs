@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
+use tokio::time::timeout;
 
 #[derive(Debug)]
 struct BrokerMessage {
@@ -102,86 +104,142 @@ async fn handle_consumer(
             break;
         };
 
-        let message_id_bytes = broker_message.id.to_be_bytes();
+        let delivery_result =
+            deliver_and_wait_for_ack(&mut consumer_stream, consumer_address, &broker_message).await;
 
-        let message_length = broker_message.payload.len() as u32;
+        match delivery_result {
+            Ok(()) => {}
 
-        let length_bytes = message_length.to_be_bytes();
+            Err(error) => {
+                println!(
+                    "Delivery of message {} to consumer {} failed: {}",
+                    broker_message.id, consumer_address, error
+                );
 
-        consumer_stream.write_all(&message_id_bytes).await?;
+                println!("Requeueing message {}.", broker_message.id);
 
-        consumer_stream.write_all(&length_bytes).await?;
+                message_sender
+                    .send(broker_message)
+                    .await
+                    .map_err(|send_error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            format!(
+                                "Failed to requeue message after delivery failure: \
+                             {send_error}"
+                            ),
+                        )
+                    })?;
 
-        consumer_stream.write_all(&broker_message.payload).await?;
+                return Err(error);
+            }
+        }
+    }
 
-        println!(
-            "Broker sent message {} with {} payload bytes \
-     to consumer {}.",
-            broker_message.id, message_length, consumer_address
-        );
+    Ok(())
+}
 
-        let mut ack_marker_buffer = [0_u8; 1];
+async fn deliver_and_wait_for_ack(
+    consumer_stream: &mut TcpStream,
+    consumer_address: std::net::SocketAddr,
+    broker_message: &BrokerMessage,
+) -> Result<(), std::io::Error> {
+    let message_id_bytes = broker_message.id.to_be_bytes();
 
-        if let Err(error) = consumer_stream.read_exact(&mut ack_marker_buffer).await {
-            println!(
-                "Consumer {consumer_address} disconnected before \
-         acknowledging message {}.",
-                broker_message.id
-            );
+    let message_length = broker_message.payload.len() as u32;
 
-            println!("Requeueing message {}.", broker_message.id);
+    let length_bytes = message_length.to_be_bytes();
 
-            message_sender
-                .send(broker_message)
-                .await
-                .map_err(|send_error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        format!(
-                            "Failed to requeue message after consumer failure: \
-                     {send_error}"
-                        ),
-                    )
-                })?;
+    consumer_stream.write_all(&message_id_bytes).await?;
 
-            return Err(error);
+    consumer_stream.write_all(&length_bytes).await?;
+
+    consumer_stream.write_all(&broker_message.payload).await?;
+
+    println!(
+        "Broker sent message {} with {} payload bytes \
+         to consumer {}.",
+        broker_message.id, message_length, consumer_address
+    );
+
+    let mut ack_marker_buffer = [0_u8; 1];
+
+    let ack_result = timeout(
+        Duration::from_secs(3),
+        consumer_stream.read_exact(&mut ack_marker_buffer),
+    )
+    .await;
+
+    match ack_result {
+        Ok(read_result) => {
+            read_result?;
         }
 
-        let ack_marker = ack_marker_buffer[0];
-
-        if ack_marker != 1 {
+        Err(_) => {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Consumer {consumer_address} sent invalid ACK marker {ack_marker}"),
-            ));
-        }
-
-        let mut ack_message_id_buffer = [0_u8; 8];
-
-        consumer_stream
-            .read_exact(&mut ack_message_id_buffer)
-            .await?;
-
-        let ack_message_id = u64::from_be_bytes(ack_message_id_buffer);
-
-        if ack_message_id != broker_message.id {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+                std::io::ErrorKind::TimedOut,
                 format!(
-                    "Consumer {consumer_address} acknowledged message \
-             {ack_message_id}, but broker was waiting for \
-             message {}",
+                    "Timed out waiting for ACK marker from consumer \
+                 {consumer_address} for message {}",
                     broker_message.id
                 ),
             ));
         }
-
-        println!(
-            "Broker received ACK for message {} \
-     from consumer {}.",
-            ack_message_id, consumer_address
-        );
     }
+
+    let ack_marker = ack_marker_buffer[0];
+
+    if ack_marker != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Consumer {consumer_address} sent invalid ACK marker {ack_marker}"),
+        ));
+    }
+
+    let mut ack_message_id_buffer = [0_u8; 8];
+
+    let ack_id_result = timeout(
+        Duration::from_secs(3),
+        consumer_stream.read_exact(&mut ack_message_id_buffer),
+    )
+    .await;
+
+    match ack_id_result {
+        Ok(read_result) => {
+            read_result?;
+        }
+
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Timed out waiting for ACK message ID from consumer \
+                 {consumer_address} for message {}",
+                    broker_message.id
+                ),
+            ));
+        }
+    }
+
+    let ack_message_id = u64::from_be_bytes(ack_message_id_buffer);
+
+    if ack_message_id != broker_message.id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Consumer {consumer_address} acknowledged message \
+                 {ack_message_id}, but broker was waiting for \
+                 message {}",
+                broker_message.id
+            ),
+        ));
+    }
+
+    println!(
+        "Broker received ACK for message {} \
+         from consumer {}.",
+        ack_message_id, consumer_address
+    );
 
     Ok(())
 }
