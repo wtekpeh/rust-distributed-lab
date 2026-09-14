@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 struct Message {
-    id: u64,
     payload: String,
 }
 
@@ -17,27 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Consumer connected to broker.");
     println!("Waiting for message...");
 
-    /*  Delimiter Framing
-    let mut reader = BufReader::new(stream);
-
     loop {
-        let mut message = String::new();
-
-        let bytes_read = reader.read_line(&mut message).await?;
-
-        if bytes_read == 0 {
-            println!("Broker closed the connection.");
-            break;
-        }
-
-        let message = message.trim_end();
-
-        println!("Consumer received message: {message}");
-    }
-    */
-
-    loop {
-        let mut message_id_buffer = [0_u8; 8];
+        let mut message_id_buffer = [0_u8; 16];
 
         match stream.read_exact(&mut message_id_buffer).await {
             Ok(_) => {}
@@ -50,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => return Err(error.into()),
         }
 
-        let broker_message_id = u64::from_be_bytes(message_id_buffer);
+        let broker_message_id = Uuid::from_bytes(message_id_buffer);
 
         let mut length_buffer = [0_u8; 4];
 
@@ -72,15 +53,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let message: Message = serde_json::from_slice(&message_buffer)?;
 
         println!(
-            "Consumer received broker message {} containing application message {}: {}",
-            broker_message_id, message.id, message.payload
+            "Consumer received broker message {}: {}",
+            broker_message_id, message.payload
         );
 
         let ack_marker = 1_u8;
 
         stream.write_all(&[ack_marker]).await?;
 
-        stream.write_all(&broker_message_id.to_be_bytes()).await?;
+        stream.write_all(broker_message_id.as_bytes()).await?;
 
         println!(
             "Consumer acknowledged broker message {}.",

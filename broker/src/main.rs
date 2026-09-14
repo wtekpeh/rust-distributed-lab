@@ -4,10 +4,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
+use uuid::Uuid;
 
 #[derive(Debug)]
 struct BrokerMessage {
-    id: u64,
+    id: Uuid,
     payload: Vec<u8>,
 }
 
@@ -144,13 +145,13 @@ async fn deliver_and_wait_for_ack(
     consumer_address: std::net::SocketAddr,
     broker_message: &BrokerMessage,
 ) -> Result<(), std::io::Error> {
-    let message_id_bytes = broker_message.id.to_be_bytes();
+    let message_id_bytes = broker_message.id.as_bytes();
 
     let message_length = broker_message.payload.len() as u32;
 
     let length_bytes = message_length.to_be_bytes();
 
-    consumer_stream.write_all(&message_id_bytes).await?;
+    consumer_stream.write_all(message_id_bytes).await?;
 
     consumer_stream.write_all(&length_bytes).await?;
 
@@ -196,7 +197,7 @@ async fn deliver_and_wait_for_ack(
         ));
     }
 
-    let mut ack_message_id_buffer = [0_u8; 8];
+    let mut ack_message_id_buffer = [0_u8; 16];
 
     let ack_id_result = timeout(
         Duration::from_secs(3),
@@ -221,7 +222,7 @@ async fn deliver_and_wait_for_ack(
         }
     }
 
-    let ack_message_id = u64::from_be_bytes(ack_message_id_buffer);
+    let ack_message_id = Uuid::from_bytes(ack_message_id_buffer);
 
     if ack_message_id != broker_message.id {
         return Err(std::io::Error::new(
@@ -250,7 +251,7 @@ async fn handle_producer(
     message_sender: mpsc::Sender<BrokerMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
-        let mut message_id_buffer = [0_u8; 8];
+        let mut message_id_buffer = [0_u8; 16];
 
         match producer_stream.read_exact(&mut message_id_buffer).await {
             Ok(_) => {}
@@ -269,7 +270,7 @@ async fn handle_producer(
             }
         }
 
-        let message_id = u64::from_be_bytes(message_id_buffer);
+        let message_id = Uuid::from_bytes(message_id_buffer);
 
         let mut length_buffer = [0_u8; 4];
 
