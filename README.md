@@ -59,43 +59,42 @@ Messages now travel over TCP using a broker envelope followed by the
 serialized application payload:
 
 ``` text
-┌───────────────────┬──────────────────────┬─────────────────────────────┐
-│ 8-byte message ID │ 4-byte payload length│ serialized message payload  │
-└───────────────────┴──────────────────────┴─────────────────────────────┘
+┌──────────────────────┬──────────────────────┬─────────────────────────────┐
+│ 16-byte UUID         │ 4-byte payload length│ serialized message payload  │
+└──────────────────────┴──────────────────────┴─────────────────────────────┘
 ```
 
-The broker message ID is a big-endian `u64`. The payload length is a
-big-endian `u32`. The payload is currently JSON.
+The broker message ID is a UUID generated once by the producer. It is sent as
+16 raw UUID bytes and is preserved by the broker through queueing, delivery,
+and retry. The payload length is a big-endian `u32`. The payload is currently
+JSON.
 
-The broker therefore understands the message identity and framing
-metadata without needing to deserialize the application payload.
+The broker therefore understands message identity and framing metadata without
+needing to deserialize the application payload.
 
 Example application payload:
 
 ``` json
 {
-  "id": 1,
   "payload": "Message One"
 }
 ```
 
-The application-level JSON still temporarily contains its own `id`.
-During V7 the broker envelope ID and application ID were deliberately
-kept separate so that broker-level delivery identity could be introduced
-without simultaneously redesigning the application schema. Stable,
-globally useful identity is deferred to V9.
+The application payload no longer contains a duplicate numeric message ID.
+Delivery identity belongs to the broker envelope, while the JSON remains
+business/application data.
 
 Consumer acknowledgements travel in the reverse direction on the same
 full-duplex TCP connection:
 
 ``` text
 ┌───────────────────┬──────────────────────┐
-│ 1-byte ACK marker │ 8-byte message ID    │
+│ 1-byte ACK marker │ 16-byte UUID         │
 └───────────────────┴──────────────────────┘
 ```
 
-The valid ACK marker is currently `1`. The message ID allows the broker
-to correlate the acknowledgement with the message it has in flight.
+The valid ACK marker is currently `1`. The UUID allows the broker to correlate
+the acknowledgement with the exact message it has in flight.
 
 ------------------------------------------------------------------------
 
@@ -1089,9 +1088,178 @@ related.
 
 ------------------------------------------------------------------------
 
+# V9 --- Stable Message Identity and Idempotent Consumer Processing
+
+**Status: ✅ Complete**
+
+V8 introduced retry, but retry creates an unavoidable ambiguity. A consumer
+may successfully perform its business work and then lose the connection before
+the broker receives the ACK. The broker cannot safely assume the work happened,
+so it retries. Without stable identity, the consumer cannot reliably recognize
+that the retry is the same logical message.
+
+## Stable producer-generated identity
+
+The earlier producer-local `u64` IDs were replaced with UUIDs. Each producer
+generates a UUID once when creating a broker message. The broker does not create
+a new ID during delivery or retry; it preserves the original UUID.
+
+``` text
+Producer generates UUID X
+        ↓
+Broker receives X
+        ↓
+Broker queues X
+        ↓
+Broker delivers X
+        ↓
+Consumer ACKs X
+```
+
+This also removes the collision problem observed in V5, where independent
+producer processes could each generate local IDs `1` through `5`.
+
+The broker envelope now stores:
+
+``` rust
+struct BrokerMessage {
+    id: Uuid,
+    payload: Vec<u8>,
+}
+```
+
+The application JSON was simplified to business data only:
+
+``` rust
+struct Message {
+    payload: String,
+}
+```
+
+This keeps delivery identity separate from application schema.
+
+## Consumer deduplication
+
+The consumer now keeps an in-memory set of successfully processed message IDs:
+
+``` rust
+HashSet<Uuid>
+```
+
+For each delivery it asks whether the UUID has already been processed:
+
+``` text
+                     ┌── known UUID ──► skip business work ──┐
+receive UUID ────────┤                                       ├──► ACK
+                     └── new UUID ──► process ──► remember ──┘
+```
+
+A duplicate is still acknowledged. Skipping the ACK would cause the broker to
+time out or observe a failed delivery, requeue the same message, and retry it
+again indefinitely.
+
+The UUID is inserted only after the simulated business processing succeeds and
+before the ACK is sent. Recording it before successful processing could cause a
+retry to be skipped even though the business work never completed.
+
+## Consumer lifetime versus connection lifetime
+
+The processed-ID set was moved outside the TCP connection loop. The consumer
+process can therefore reconnect after a broken broker connection without losing
+its in-memory deduplication state.
+
+``` text
+Consumer process lifetime
+──────────────────────────────────────────────►
+
+processed IDs: { X }
+
+Connection 1 ───────X     Connection 2 ─────────────►
+                          X is still remembered
+```
+
+This established an important distinction: a consumer process and one of its
+TCP connections do not have to share the same lifetime.
+
+## Lost-ACK idempotency experiment
+
+The consumer was temporarily modified to process the first message successfully,
+insert its UUID into the processed-ID set, and then deliberately close the
+connection before sending the ACK.
+
+The tested message used UUID:
+
+``` text
+da217cf8-e25a-4f9b-aa3c-59c92998062f
+```
+
+The consumer first reported successful processing followed by the simulated
+lost ACK. The broker then observed `early eof` and requeued the same UUID.
+
+Because requeueing currently places the failed message at the tail, messages
+Two through Five were delivered before the retry of Message One. This again
+confirmed that retry can change observed delivery order.
+
+When the original UUID returned after reconnection, the consumer found it in
+its `HashSet<Uuid>`, skipped the business processing, and still sent a valid
+ACK. The broker accepted that ACK.
+
+The observed behaviour was therefore:
+
+``` text
+delivery attempt 1: X → process → remember → ACK lost
+delivery attempt 2: X → duplicate detected → skip work → ACK succeeds
+```
+
+The broker delivered the logical message more than once, but the consumer's
+in-memory idempotency mechanism prevented the simulated business work from being
+performed twice.
+
+## Final regression run
+
+After removing the deliberate ACK-loss code, a clean run sent five messages
+with five distinct UUIDs. Every message was processed once, acknowledged with
+the same UUID, and accepted by the broker. No duplicate path was triggered.
+
+## Semantics and limitations after V9
+
+V9 does **not** provide exactly-once delivery. The broker still retries when it
+lacks proof of completion, so duplicate delivery remains possible. The consumer
+now uses stable identity and deduplication to suppress duplicate processing
+within the lifetime of that consumer process.
+
+The deduplication set is currently stored only in RAM. If the consumer process
+terminates and restarts, its processed-ID history is lost. There is also still a
+failure window between performing a real business side effect and recording the
+UUID as processed. Durable idempotency would require persistent state and, for
+stronger guarantees, careful coordination between the business side effect and
+the deduplication record.
+
+The broker queue is also still in memory. A broker process crash can lose queued
+or in-flight state. This limitation leads directly to V10 persistence.
+
+### Lessons learned
+
+Retries require stable logical identity if consumers are expected to recognize
+redelivery of the same work.
+
+The producer should create the message identity once and the broker must preserve
+it across retries.
+
+At-least-once delivery can produce duplicate deliveries even when duplicate
+business processing is suppressed.
+
+Idempotent consumers should acknowledge recognized duplicates after skipping the
+repeated business operation.
+
+In-memory deduplication survives connection failure only while the consumer
+process itself remains alive. Durable failure recovery requires persistence.
+
+------------------------------------------------------------------------
+
 # Current Architecture
 
-After completing V8:
+After completing V9:
 
 ``` text
 Producer A ──► handler task A ──┐
@@ -1126,12 +1294,12 @@ Current characteristics:
 -   one Tokio task per consumer connection
 -   competing-consumer work distribution
 -   one shared bounded in-memory queue
--   `BrokerMessage { id, payload }` broker envelope
--   broker-level message identity on the wire
+-   `BrokerMessage { id: Uuid, payload }` broker envelope
+-   stable producer-generated UUID identity on the wire
 -   JSON application payload remains opaque to the broker
 -   application-level consumer acknowledgements
 -   one in-flight message per consumer connection
--   ACK marker and ACK message-ID validation
+-   ACK marker and 16-byte UUID validation
 -   ACK deadlines
 -   requeue after delivery failure
 -   retry-induced reordering is possible
@@ -1141,8 +1309,9 @@ Current characteristics:
 -   no guaranteed global ordering across producers
 -   no guaranteed round-robin distribution across consumers
 -   no durable persistence
--   no globally stable message identity yet
--   no consumer idempotency yet
+-   consumer-side in-memory `HashSet<Uuid>` deduplication
+-   consumer reconnection can retain deduplication state within the same process
+-   no durable consumer deduplication yet
 -   no retry limit or dead-letter queue yet
 
 ------------------------------------------------------------------------
@@ -1159,7 +1328,7 @@ Current characteristics:
   V6        Multiple consumers                      ✅
   V7        Acknowledgements                        ✅
   V8        Failure and retry                       ✅
-  V9        Stable message IDs and idempotency      ⏳
+  V9        Stable message IDs and idempotency      ✅
   V10       Persistence                             ⏳
   V11       Pub/Sub                                 ⏳
   V12       Consumer groups                         ⏳
