@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: broker
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: broker
+
+  template:
+    metadata:
+      labels:
+        app: broker
+
+    spec:
+      containers:
+        - name: broker
+          image: rust-distributed-broker:v2
+
+          ports:
+            - name: producer
+              containerPort: 7000
+
+            - name: consumer
+              containerPort: 7001
+
+          env:
+            - name: BROKER_PRODUCER_BIND_ADDRESS
+              value: "0.0.0.0:7000"
+
+            - name: BROKER_CONSUMER_BIND_ADDRESS
+              value: "0.0.0.0:7001"

@@ -1,3 +1,4 @@
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,11 +17,17 @@ struct BrokerMessage {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Broker starting...");
 
-    let producer_listener = TcpListener::bind("127.0.0.1:7000").await?;
-    let consumer_listener = TcpListener::bind("127.0.0.1:7001").await?;
+    let producer_bind_address =
+        env::var("BROKER_PRODUCER_BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
 
-    println!("Broker listening for producers on 127.0.0.1:7000");
-    println!("Broker listening for consumers on 127.0.0.1:7001");
+    let consumer_bind_address =
+        env::var("BROKER_CONSUMER_BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:7001".to_string());
+
+    let producer_listener = TcpListener::bind(&producer_bind_address).await?;
+    let consumer_listener = TcpListener::bind(&consumer_bind_address).await?;
+
+    println!("Broker listening for producers on {producer_bind_address}");
+    println!("Broker listening for consumers on {consumer_bind_address}");
 
     let (message_sender, message_receiver) = mpsc::channel::<BrokerMessage>(3);
 

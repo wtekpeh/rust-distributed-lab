@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::env;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -12,7 +13,12 @@ struct Message {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Producer starting...");
 
-    let mut stream = TcpStream::connect("127.0.0.1:7000").await?;
+    let broker_address =
+        env::var("BROKER_PRODUCER_ADDRESS").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
+
+    println!("Producer connecting to broker at {broker_address}...");
+
+    let mut stream = TcpStream::connect(&broker_address).await?;
 
     println!("Producer connected to broker.");
 

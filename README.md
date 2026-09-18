@@ -29,8 +29,12 @@ rust-distributed-lab/
 ├── broker/
 ├── producer/
 ├── consumer/
+├── docker/
+├── k8s/
 ├── Cargo.toml
-└── README.md
+├── Cargo.lock
+├── README.md
+└── KUBERNETES.md
 ```
 
 ### Producer
@@ -1313,6 +1317,60 @@ Current characteristics:
 -   consumer reconnection can retain deduplication state within the same process
 -   no durable consumer deduplication yet
 -   no retry limit or dead-letter queue yet
+
+------------------------------------------------------------------------
+
+# Runtime Network Configuration
+
+The producer, broker, and consumer now support runtime-configurable network
+addresses. This keeps the application independent of the environment in which
+it runs: the same binaries can be used during local development, inside
+containers, or under an orchestrator without hardcoding environment-specific
+hostnames into the Rust source.
+
+The broker controls where its server sockets listen through:
+
+``` text
+BROKER_PRODUCER_BIND_ADDRESS
+BROKER_CONSUMER_BIND_ADDRESS
+```
+
+If these variables are absent, the broker retains the local-development
+defaults:
+
+``` text
+127.0.0.1:7000
+127.0.0.1:7001
+```
+
+The producer and consumer independently control where they connect through:
+
+``` text
+Producer: BROKER_PRODUCER_ADDRESS
+Consumer: BROKER_CONSUMER_ADDRESS
+```
+
+Their local-development fallbacks remain:
+
+``` text
+Producer → 127.0.0.1:7000
+Consumer → 127.0.0.1:7001
+```
+
+This separates two different networking responsibilities:
+
+``` text
+server side:  where should I LISTEN?
+client side:  where should I CONNECT?
+```
+
+The configuration change does not alter the message protocol, queueing, ACK,
+retry, or idempotency behaviour described above. It only removes the previous
+hard dependency on localhost addresses.
+
+Kubernetes deployment and orchestration are documented separately in
+`KUBERNETES.md` so that this README remains focused on the distributed-system
+implementation and its learning progression.
 
 ------------------------------------------------------------------------
 

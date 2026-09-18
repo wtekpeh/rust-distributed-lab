@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::env;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -20,10 +21,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // were already processed.
     let mut processed_message_ids: HashSet<Uuid> = HashSet::new();
 
+    let broker_address =
+        env::var("BROKER_CONSUMER_ADDRESS").unwrap_or_else(|_| "127.0.0.1:7001".to_string());
+
+    println!("Consumer will connect to broker at {broker_address}.");
+
     loop {
         println!("Consumer connecting to broker...");
 
-        let mut stream = TcpStream::connect("127.0.0.1:7001").await?;
+        let mut stream = TcpStream::connect(&broker_address).await?;
 
         println!("Consumer connected to broker.");
 
