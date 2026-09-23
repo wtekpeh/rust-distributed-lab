@@ -1422,7 +1422,698 @@ replicas coordinate state.
 
 ---
 
-## 33. Current Checkpoint — 19 September 2026
+## 33. Consumer Containerization
+
+The next practical step was to package the real Rust consumer as a container image.
+
+`docker/consumer.Dockerfile`:
+
+```dockerfile
+FROM rust:1.90-bookworm AS builder
+
+WORKDIR /app
+
+COPY . .
+
+RUN cargo build --release -p consumer
+
+
+FROM debian:bookworm-slim AS runtime
+
+COPY --from=builder /app/target/release/consumer /usr/local/bin/consumer
+
+ENTRYPOINT ["/usr/local/bin/consumer"]
+```
+
+The image was built as:
+
+```text
+rust-distributed-consumer:v1
+```
+
+and then loaded into the kind Node:
+
+```bash
+kind load docker-image rust-distributed-consumer:v1 \
+  --name rust-distributed-lab
+```
+
+Inspection with `crictl images` inside the kind Node confirmed that the image was
+available to the Node's container runtime.
+
+This reinforced the distinction:
+
+```text
+Image available on Node
+        !=
+Pod exists
+        !=
+container is running
+        !=
+Rust process is running
+```
+
+---
+
+## 34. Consumer Deployment
+
+The consumer is a long-running process. It connects to the broker, waits for
+messages, processes them, acknowledges them, and continues waiting. Its lifecycle
+therefore fits a Kubernetes Deployment.
+
+`k8s/consumer-deployment.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: consumer
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: consumer
+
+  template:
+    metadata:
+      labels:
+        app: consumer
+
+    spec:
+      containers:
+        - name: consumer
+          image: rust-distributed-consumer:v1
+
+          env:
+            - name: BROKER_CONSUMER_ADDRESS
+              value: "broker:7001"
+```
+
+The Consumer Deployment does not declare a `ports` section because the consumer
+does not listen for inbound application connections. It initiates an outbound TCP
+connection to the Broker Service.
+
+For the same reason, the current architecture does not require a Consumer Service.
+No other workload needs a stable Kubernetes endpoint through which to initiate a
+connection to the consumer.
+
+The Deployment was applied with:
+
+```bash
+kubectl apply -f k8s/consumer-deployment.yaml
+```
+
+The observed Consumer Pod was:
+
+```text
+consumer-8c5c7b49b-mvcvh
+```
+
+with Pod IP:
+
+```text
+10.244.0.9
+```
+
+and status:
+
+```text
+Ready:    1/1
+Status:   Running
+Restarts: 0
+```
+
+---
+
+## 35. First Real Pod-to-Service-to-Pod Connection
+
+The Consumer logs showed:
+
+```text
+Consumer starting...
+Consumer will connect to broker at broker:7001.
+Consumer connecting to broker...
+Consumer connected to broker.
+Waiting for message...
+```
+
+The Broker logs independently showed:
+
+```text
+Consumer connected from 10.244.0.9:55396
+```
+
+The address `10.244.0.9` matched the Consumer Pod IP. The port `55396` was the
+consumer TCP connection's ephemeral source port.
+
+This provided the first real proof of the complete path:
+
+```text
+Consumer Pod
+10.244.0.9
+    |
+    | TcpStream::connect("broker:7001")
+    v
+Kubernetes DNS
+    |
+    v
+Broker Service
+ClusterIP 10.96.149.118
+    |
+    | Service port 7001
+    v
+EndpointSlice
+10.244.0.8:7001
+    |
+    v
+Broker Pod
+10.244.0.8
+    |
+    v
+Rust TcpListener::accept()
+```
+
+The Consumer application needed to know only the stable logical destination:
+
+```text
+broker:7001
+```
+
+It did not need to know the Broker Pod IP or Service ClusterIP.
+
+---
+
+## 36. Docker Desktop, kind, containerd, and `crictl`
+
+During the practical work, Docker Desktop showed the kind Node container but did
+not show the individual Kubernetes application Pods as top-level Docker
+containers.
+
+The reason is that kind creates Kubernetes Nodes as Docker containers, while the
+Kubernetes Node itself uses containerd to run Kubernetes workload containers.
+
+The observed layering is:
+
+```text
+Windows / WSL
+    |
+    v
+Docker
+    |
+    v
+rust-distributed-lab-control-plane
+(kind Node Docker container)
+    |
+    v
+containerd
+    |
+    +-- Broker application container
+    +-- Consumer application container
+    +-- Nginx application containers
+    +-- Kubernetes system containers
+```
+
+Therefore the different inspection commands answer different questions:
+
+```text
+docker ps / Docker Desktop
+    -> host Docker containers, including the kind Node
+
+kubectl get pods
+    -> Kubernetes Pod objects/workloads
+
+crictl ps inside the kind Node
+    -> containers managed by the Node's CRI/containerd runtime
+```
+
+The command:
+
+```bash
+docker exec rust-distributed-lab-control-plane \
+  crictl ps
+```
+
+showed both real Rust application containers, including:
+
+```text
+NAME       POD
+consumer   consumer-8c5c7b49b-mvcvh
+broker     broker-6d4549c644-lkfvc
+```
+
+This also reinforced that a Pod is not itself identical to a container. In the
+current application Pods there is one application container per Pod, but the
+concepts remain distinct.
+
+---
+
+## 37. Deployment Versus Job
+
+Introducing the producer exposed an important workload-lifecycle distinction.
+
+The Broker and Consumer are intended to remain alive:
+
+```text
+Broker:
+start -> listen -> continue running
+
+Consumer:
+start -> connect -> wait/process -> continue running
+```
+
+A Deployment therefore fits their desired state:
+
+```text
+Desired state: RUNNING
+```
+
+The current Producer behaves differently:
+
+```text
+start
+  |
+  v
+connect to broker
+  |
+  v
+send five messages
+  |
+  v
+exit successfully
+```
+
+For this workload, process termination is success rather than failure. A
+Kubernetes Job is designed for work that should run to successful completion.
+
+The core distinction established was:
+
+```text
+Deployment
+    -> maintain running workload replicas
+
+Job
+    -> achieve successful completion of work
+```
+
+The workload type should therefore be chosen according to the process lifecycle,
+not simply because an application has been containerized.
+
+If a future Producer version becomes a continuously running service, that process
+lifecycle may fit a Deployment instead. That would be a different workload model,
+not merely a normal rolling update of the existing Job into a Deployment.
+
+---
+
+## 38. Producer Containerization
+
+The real Rust producer was packaged with the same multi-stage pattern.
+
+`docker/producer.Dockerfile`:
+
+```dockerfile
+FROM rust:1.90-bookworm AS builder
+
+WORKDIR /app
+
+COPY . .
+
+RUN cargo build --release -p producer
+
+
+FROM debian:bookworm-slim AS runtime
+
+COPY --from=builder /app/target/release/producer /usr/local/bin/producer
+
+ENTRYPOINT ["/usr/local/bin/producer"]
+```
+
+The image was built as:
+
+```text
+rust-distributed-producer:v1
+```
+
+and loaded into kind:
+
+```bash
+kind load docker-image rust-distributed-producer:v1 \
+  --name rust-distributed-lab
+```
+
+Loading the image did not execute the producer. It only made the image available
+to the Node's container runtime.
+
+---
+
+## 39. Producer Job
+
+The Producer Job is defined in:
+
+```text
+k8s/producer-job.yaml
+```
+
+Current manifest:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+
+metadata:
+  name: producer
+
+spec:
+  template:
+    metadata:
+      labels:
+        app: producer
+
+    spec:
+      restartPolicy: Never
+
+      containers:
+        - name: producer
+          image: rust-distributed-producer:v1
+
+          env:
+            - name: BROKER_PRODUCER_ADDRESS
+              value: "broker:7000"
+```
+
+Jobs belong to the Kubernetes `batch/v1` API group. This API version is unrelated
+to the `v1` container-image tag.
+
+The Job's Pod receives:
+
+```text
+BROKER_PRODUCER_ADDRESS=broker:7000
+```
+
+so the Rust producer remains environment-agnostic and obtains its Kubernetes
+network destination through runtime configuration.
+
+The Pod uses:
+
+```yaml
+restartPolicy: Never
+```
+
+For this first Job experiment, this makes the container lifecycle particularly
+clear. Successful process termination allows the Pod to reach `Completed`, while
+Job-level completion/retry behaviour remains a separate Kubernetes concern to be
+explored later.
+
+---
+
+## 40. Successful Job Completion
+
+The Producer Job was observed as:
+
+```text
+NAME       STATUS     COMPLETIONS   DURATION
+producer   Complete   1/1           3s
+```
+
+Its Pod was observed as:
+
+```text
+NAME             READY   STATUS      RESTARTS
+producer-sz9fc   0/1     Completed   0
+```
+
+For a Job, `Completed` is success rather than an error condition.
+
+The lifecycle was:
+
+```text
+Job
+ |
+ v
+Producer Pod created
+ |
+ v
+container starts
+ |
+ v
+/usr/local/bin/producer
+ |
+ v
+connect broker:7000
+ |
+ v
+send five messages
+ |
+ v
+Rust process exits successfully
+ |
+ v
+container terminates
+ |
+ v
+Pod: Completed
+ |
+ v
+Job: Complete 1/1
+```
+
+This establishes a deeper distinction than simply "continuous versus one-time":
+
+```text
+Deployment desired state -> running
+Job desired state        -> successful completion
+```
+
+The Job already existed when a later `kubectl apply` was issued, so Kubernetes
+reported:
+
+```text
+job.batch/producer unchanged
+```
+
+Reapplying the same completed Job object does not mean "execute this command
+again." The named Job already represents a completed execution.
+
+---
+
+## 41. Producer Service Discovery and Logs
+
+The completed Job retained logs that could be inspected with:
+
+```bash
+kubectl logs job/producer
+```
+
+Observed output included:
+
+```text
+Producer starting...
+Producer connecting to broker at broker:7000...
+Producer connected to broker.
+Producer sent message 5f0553cf-3457-4aae-a92f-da603b424dcf as 25 serialized bytes.
+Producer sent message 0c6fd7e8-ff99-496d-9d65-78c154fbfc28 as 25 serialized bytes.
+Producer sent message 2bdba34b-e617-4fc2-bdfd-fef6099d065f as 27 serialized bytes.
+Producer sent message cf4d6284-d8e4-4373-a497-792263aef921 as 26 serialized bytes.
+Producer sent message f53b9699-49be-4f80-a974-80970d5a497c as 26 serialized bytes.
+```
+
+The Producer therefore successfully used Kubernetes DNS and the Broker Service
+through port 7000.
+
+The Broker observed the Producer connection from:
+
+```text
+10.244.0.10:40610
+```
+
+where `10.244.0.10` was the Producer Pod's network identity and `40610` was the
+connection's ephemeral source port.
+
+---
+
+## 42. Full Producer -> Broker -> Consumer Proof
+
+The Broker logs showed all five Producer message UUIDs arriving from the Producer
+Pod, entering the bounded queue, being delivered to the Consumer, and receiving
+ACKs.
+
+For example, the first message followed this application-level path:
+
+```text
+Producer
+5f0553cf-3457-4aae-a92f-da603b424dcf
+        |
+        v
+Broker receives message
+        |
+        v
+bounded Tokio MPSC queue
+        |
+        v
+Broker sends message to Consumer
+        |
+        v
+Consumer processes message
+        |
+        v
+Consumer sends ACK with same UUID
+        |
+        v
+Broker validates/receives ACK
+```
+
+The Consumer independently logged:
+
+```text
+Consumer received broker message 5f0553cf-3457-4aae-a92f-da603b424dcf: Message One
+Consumer acknowledged broker message 5f0553cf-3457-4aae-a92f-da603b424dcf.
+
+Consumer received broker message 0c6fd7e8-ff99-496d-9d65-78c154fbfc28: Message Two
+Consumer acknowledged broker message 0c6fd7e8-ff99-496d-9d65-78c154fbfc28.
+
+Consumer received broker message 2bdba34b-e617-4fc2-bdfd-fef6099d065f: Message Three
+Consumer acknowledged broker message 2bdba34b-e617-4fc2-bdfd-fef6099d065f.
+
+Consumer received broker message cf4d6284-d8e4-4373-a497-792263aef921: Message Four
+Consumer acknowledged broker message cf4d6284-d8e4-4373-a497-792263aef921.
+
+Consumer received broker message f53b9699-49be-4f80-a974-80970d5a497c: Message Five
+Consumer acknowledged broker message f53b9699-49be-4f80-a974-80970d5a497c.
+```
+
+This provides end-to-end evidence from all three independent Rust processes.
+
+---
+
+## 43. Backpressure Still Works Under Kubernetes
+
+The Broker logs also exposed the existing bounded-channel backpressure behaviour.
+
+The broker's Tokio MPSC channel has capacity three. During the five-message run,
+a Producer handler reached an `attempting to queue` log for a later message before
+space was immediately available. A message was then removed from the queue for
+consumer delivery, after which the producer handler could log that the waiting
+message had been queued.
+
+Conceptually:
+
+```text
+Producer handler
+    |
+    v
+bounded queue full
+    |
+    | await capacity
+    v
+Consumer side removes/delivers a queued message
+    |
+    v
+capacity becomes available
+    |
+    v
+Producer handler continues queueing
+```
+
+Kubernetes did not implement this backpressure. The behaviour remains part of the
+Rust distributed-services application and continued to function after the
+processes were containerized and orchestrated.
+
+---
+
+## 44. Current End-to-End Kubernetes Architecture
+
+The real application now runs as:
+
+```text
+                         Kubernetes Cluster
+
++-----------------------+
+| Producer Job          |
+| producer:v1           |
+| finite workload       |
++-----------+-----------+
+            |
+            | broker:7000
+            v
++-------------------------------------------+
+| Service: broker                           |
+| ClusterIP: 10.96.149.118                  |
+|                                           |
+| producer :7000              consumer :7001|
++-------------------+-----------------------+
+                    |
+                    v
+          +-----------------------+
+          | Broker Deployment     |
+          | replicas: 1           |
+          | Broker Pod            |
+          | broker:v2             |
+          | Rust broker process   |
+          +-----------+-----------+
+                      |
+                      | existing consumer TCP connection
+                      v
+          +-----------------------+
+          | Consumer Deployment   |
+          | replicas: 1           |
+          | Consumer Pod          |
+          | consumer:v1           |
+          | Rust consumer process |
+          +-----------------------+
+```
+
+The Producer Pod completes after sending its finite batch. The Broker and Consumer
+remain running under their Deployments.
+
+---
+
+## 45. Kubernetes Versus Distributed-System Responsibilities
+
+The completed experiment makes the architectural boundary concrete.
+
+Kubernetes currently provides or manages:
+
+```text
+- workload creation;
+- Deployment reconciliation;
+- Job completion tracking;
+- Pod/container execution;
+- service discovery;
+- DNS;
+- stable Broker Service identity;
+- Pod networking;
+- runtime environment injection;
+- application image placement on the Node.
+```
+
+The Rust distributed-services application still provides:
+
+```text
+- TCP application protocol;
+- length-prefix framing;
+- UUID message identity;
+- bounded Tokio MPSC queue;
+- backpressure;
+- message delivery;
+- acknowledgement markers;
+- acknowledgement UUID validation;
+- retry/requeue behaviour;
+- consumer-side duplicate detection.
+```
+
+The important principle remains:
+
+```text
+Kubernetes orchestrates the processes.
+
+The distributed application defines message semantics and correctness.
+```
+
+---
+
+## 46. Current Checkpoint — 23 September 2026
 
 Completed:
 
@@ -1434,128 +2125,118 @@ Completed:
 - scaling;
 - rolling updates;
 - labels and selectors;
-- Services;
-- ClusterIP;
-- DNS/service-discovery mental model;
+- Services and ClusterIP;
+- DNS/service discovery;
 - EndpointSlice;
 - kube-proxy/service datapath mental model;
 - CNI and Pod networking fundamentals;
 - Docker multi-stage Rust builds;
-- Broker V1 image;
-- loopback binding experiment;
+- Broker V1 loopback experiment;
 - runtime-configurable Broker bind addresses;
 - Broker V2 image;
-- Docker end-to-end Broker V2 test;
-- loading local images into kind;
-- real Rust Broker Deployment;
-- Kubernetes environment-variable injection;
+- real Broker Deployment;
 - real Broker Service exposing ports 7000 and 7001;
-- verified Service ClusterIP;
-- verified EndpointSlice pointing to the real Broker Pod;
-- runtime-configurable Producer destination;
-- runtime-configurable Consumer destination;
-- `cargo check -p producer` successful;
-- `cargo check -p consumer` successful.
+- runtime-configurable Producer and Consumer destinations;
+- Consumer V1 container image;
+- Consumer image loaded into kind;
+- Consumer Deployment;
+- successful Consumer Pod -> `broker:7001` -> Broker Pod connection;
+- direct inspection of Kubernetes containers using `crictl` inside the kind Node;
+- Docker Desktop / kind / containerd runtime-layer distinction;
+- Deployment-versus-Job workload lifecycle model;
+- Producer V1 container image;
+- Producer image loaded into kind;
+- Producer Job using `batch/v1`;
+- successful Producer Job completion;
+- successful Producer Pod -> `broker:7000` -> Broker Pod connection;
+- complete five-message Producer -> Broker -> Consumer flow;
+- verified application ACKs for all five UUIDs;
+- observed bounded-queue backpressure continuing to operate under Kubernetes.
 
-Not yet completed:
-
-```text
-docker/consumer.Dockerfile
-```
-
-has not yet been created.
-
-No Consumer Kubernetes workload has been created.
-
-No Producer Kubernetes workload has been created.
-
-Therefore Pod-to-Service-to-Pod communication using the real producer and
-consumer has not yet been demonstrated.
-
----
-
-## 34. Exact Resume Point
-
-The next implementation step is:
+The major practical milestone is now:
 
 ```text
-Containerize Consumer
-        |
-        v
-build consumer image
-        |
-        v
-load image into kind
-        |
-        v
-create appropriate Consumer workload
-        |
-        v
-inject:
-BROKER_CONSUMER_ADDRESS=broker:7001
-        |
-        v
-Consumer Pod
-        |
-        | TCP broker:7001
-        v
+Real Rust Producer
+      |
+      | Kubernetes Job
+      | broker:7000
+      v
 Broker Service
+      |
+      v
+Real Rust Broker
+      |
+      | application queue / ACK protocol
+      v
+Real Rust Consumer
+      |
+      v
+five messages processed and acknowledged
+```
+
+The original near-term steps of containerizing/deploying the Consumer,
+containerizing/running the Producer, and proving the complete real application
+path have therefore been completed.
+
+---
+
+## 47. Exact Resume Point
+
+The next Kubernetes work should begin from this known-good state rather than
+repeating the basic deployment path.
+
+A natural next practical stage is to exercise Kubernetes recovery and
+reconciliation using the real Rust workloads rather than Nginx.
+
+For example, future experiments can deliberately replace/fail an application Pod
+and observe:
+
+```text
+Deployment desired state
         |
         v
-Broker Pod
+Pod failure/deletion
+        |
+        v
+ReplicaSet / controller reconciliation
+        |
+        v
+replacement Pod
+        |
+        v
+Service EndpointSlice update
+        |
+        v
+application reconnect behaviour
 ```
 
-The consumer is long-running, so its lifecycle naturally fits a Kubernetes
-Deployment.
+This must be interpreted together with the current application's own reconnect
+and in-memory-state semantics. Kubernetes can replace a process, but replacement
+does not preserve the Broker's in-memory queue.
 
-The producer behaves differently: it sends its finite set of messages and exits
-successfully. Its Kubernetes workload type should therefore be chosen according
-to that finite lifecycle rather than automatically treating every application
-as a Deployment.
+After the appropriate resilience/deployment exercises, the planned learning path
+continues toward NATS and then deployment of NATS together with the Rust
+applications on Kubernetes.
 
-That workload-lifecycle distinction is the next Kubernetes concept to explore
-when the producer is introduced.
+The distributed-services implementation continues independently in parallel.
 
 ---
 
-## 35. Near-Term Learning Path
+## 48. Updated Mental Model Summary
 
-The immediate sequence is:
-
-```text
-1. Containerize Consumer
-2. Deploy Consumer
-3. Prove Consumer Pod -> broker Service -> Broker Pod
-4. Containerize Producer
-5. Introduce the Kubernetes workload model appropriate to a finite producer
-6. Run Producer inside Kubernetes
-7. Observe full Producer -> Service -> Broker -> Consumer path
-8. Exercise Pod replacement with the real Rust system
-9. Continue deployment/configuration/resilience concepts
-10. Introduce NATS and compare production broker behaviour with the handmade lab
-```
-
-The distributed-services implementation continues in parallel and is not frozen
-while Kubernetes is being learned.
-
----
-
-## 36. Mental Model Summary
-
-The current end-to-end Kubernetes mental model is:
+The workload lifecycle now has two concrete branches:
 
 ```text
+LONG-RUNNING WORKLOAD
+
 Rust source
     |
-    | cargo build
-    v
-Linux binary
-    |
-    | Docker build
     v
 container image
     |
-    | Kubernetes Deployment
+    v
+Deployment
+    |
     v
 ReplicaSet
     |
@@ -1566,42 +2247,88 @@ Pod
 container
     |
     v
-ordinary Rust Linux process
+Rust process kept running
+
+Examples:
+Broker, Consumer
 ```
 
-For networking:
+and:
 
 ```text
-Client Rust process
+FINITE WORKLOAD
+
+Rust source
     |
-    | TcpStream::connect("broker:7000/7001")
+    v
+container image
+    |
+    v
+Job
+    |
+    v
+Pod
+    |
+    v
+container
+    |
+    v
+Rust process performs work
+    |
+    v
+exit code 0
+    |
+    v
+Pod Completed
+    |
+    v
+Job Complete
+
+Example:
+Producer V1
+```
+
+The current network path is:
+
+```text
+Producer Job Pod
+    |
+    | TcpStream::connect("broker:7000")
     v
 Kubernetes DNS
     |
     v
-Service: broker
-    |
-    | stable ClusterIP
-    v
-Service networking
-    |
-    | current EndpointSlice backend
-    v
-Broker Pod IP
+Broker Service
     |
     v
-Broker container
+EndpointSlice / service datapath
     |
     v
-Rust TcpListener
+Broker Pod
+    |
+    | Rust application protocol
+    v
+bounded MPSC queue
+    |
+    v
+Consumer connection
+    |
+    v
+Consumer Pod
+    |
+    v
+process message + ACK
+    |
+    v
+Broker validates ACK
 ```
 
-And the architectural boundary remains:
+The architectural boundary remains:
 
 ```text
 Kubernetes
-manages where/how the processes run
+    manages where/how/lifecycle of processes
 
 Distributed-services code
-manages what messages mean and how delivery behaves
+    manages what messages mean and how delivery behaves
 ```

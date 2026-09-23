@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: consumer
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: consumer
+
+  template:
+    metadata:
+      labels:
+        app: consumer
+
+    spec:
+      containers:
+        - name: consumer
+          image: rust-distributed-consumer:v1
+
+          env:
+            - name: BROKER_CONSUMER_ADDRESS
+              value: "broker:7001"

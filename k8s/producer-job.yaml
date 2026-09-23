@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: Job
+
+metadata:
+  name: producer
+
+spec:
+  template:
+    metadata:
+      labels:
+        app: producer
+
+    spec:
+      restartPolicy: Never
+
+      containers:
+        - name: producer
+          image: rust-distributed-producer:v1
+
+          env:
+            - name: BROKER_PRODUCER_ADDRESS
+              value: "broker:7000"
