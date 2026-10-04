@@ -1,6 +1,7 @@
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs::{OpenOptions, create_dir_all};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
@@ -13,9 +14,35 @@ struct BrokerMessage {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct MessageLogRecord<'a> {
+    #[serde(rename = "type")]
+    record_type: &'a str,
+    id: Uuid,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<&'a [u8]>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Broker starting...");
+
+    let data_directory = "broker-data";
+
+    create_dir_all(data_directory).await?;
+
+    let log_path = format!("{data_directory}/messages.log");
+
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .await?;
+
+    let shared_log_file = Arc::new(Mutex::new(log_file));
+
+    println!("Broker persistence log: {log_path}");
 
     let producer_bind_address =
         env::var("BROKER_PRODUCER_BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
@@ -36,6 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let consumer_message_receiver = Arc::clone(&shared_message_receiver);
 
     let consumer_message_sender = message_sender.clone();
+
+    let consumer_log_file = Arc::clone(&shared_log_file);
 
     tokio::spawn(async move {
         loop {
@@ -59,12 +88,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let consumer_sender = consumer_message_sender.clone();
 
+            let consumer_log = Arc::clone(&consumer_log_file);
+
             tokio::spawn(async move {
                 let result = handle_consumer(
                     consumer_stream,
                     consumer_address,
                     consumer_receiver,
                     consumer_sender,
+                    consumer_log,
                 )
                 .await;
 
@@ -84,9 +116,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let producer_message_sender = message_sender.clone();
 
+        let producer_log_file = Arc::clone(&shared_log_file);
+
         tokio::spawn(async move {
-            let result =
-                handle_producer(producer_stream, producer_address, producer_message_sender).await;
+            let result = handle_producer(
+                producer_stream,
+                producer_address,
+                producer_message_sender,
+                producer_log_file,
+            )
+            .await;
 
             if let Err(error) = result {
                 eprintln!("Producer {producer_address} handler failed: {error}");
@@ -100,6 +139,7 @@ async fn handle_consumer(
     consumer_address: std::net::SocketAddr,
     message_receiver: Arc<Mutex<mpsc::Receiver<BrokerMessage>>>,
     message_sender: mpsc::Sender<BrokerMessage>,
+    log_file: Arc<Mutex<tokio::fs::File>>,
 ) -> Result<(), std::io::Error> {
     loop {
         let broker_message = {
@@ -116,7 +156,26 @@ async fn handle_consumer(
             deliver_and_wait_for_ack(&mut consumer_stream, consumer_address, &broker_message).await;
 
         match delivery_result {
-            Ok(()) => {}
+            Ok(()) => {
+                let ack_record = MessageLogRecord {
+                    record_type: "ACK",
+                    id: broker_message.id,
+                    payload: None,
+                };
+
+                let mut serialized_record = serde_json::to_vec(&ack_record)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
+                serialized_record.push(b'\n');
+
+                {
+                    let mut file = log_file.lock().await;
+
+                    file.write_all(&serialized_record).await?;
+                }
+
+                println!("Persisted ACK record for message {}.", broker_message.id);
+            }
 
             Err(error) => {
                 println!(
@@ -256,6 +315,7 @@ async fn handle_producer(
     mut producer_stream: TcpStream,
     producer_address: std::net::SocketAddr,
     message_sender: mpsc::Sender<BrokerMessage>,
+    log_file: Arc<Mutex<tokio::fs::File>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let mut message_id_buffer = [0_u8; 16];
@@ -320,6 +380,39 @@ async fn handle_producer(
             payload: message_buffer,
         };
 
+        // Build the durable representation of this event.
+        //
+        // The broker still treats the payload as opaque bytes.
+        // It only understands the broker-level message ID and
+        // the fact that this is a MESSAGE journal record.
+        let log_record = MessageLogRecord {
+            record_type: "MESSAGE",
+            id: broker_message.id,
+            payload: Some(&broker_message.payload),
+        };
+
+        // Serialize one complete journal record.
+        let mut serialized_record = serde_json::to_vec(&log_record)?;
+
+        // JSON Lines format:
+        // every journal record ends with '\n' so that records
+        // can later be replayed one line at a time.
+        serialized_record.push(b'\n');
+
+        // Only one task may append to the shared log file at a time.
+        {
+            let mut file = log_file.lock().await;
+
+            file.write_all(&serialized_record).await?;
+        }
+
+        println!(
+            "Persisted MESSAGE record for message {}.",
+            broker_message.id
+        );
+
+        // Only make the message available for delivery after
+        // its MESSAGE record has been written to the journal.
         message_sender.send(broker_message).await?;
 
         println!(
